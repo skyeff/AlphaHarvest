@@ -107,12 +107,20 @@ def QueryCoreAC(s,d):
             return pdf if pdf and pdf.lower().endswith(".pdf")else None
     except:return None
 
+def safe_json_str(s):
+    if not s:return""
+    return s.replace('\\','\\\\').replace('"','\\"').replace('\n','\\n').replace('\r','\\r').replace('\t','\\t')
+
 def process_item(it,s,a,filt):
-    doi,title,year=it.get("DOI")," ".join(it.get("title",[]))if it.get("title")else"",next(iter(it.get("issued",{}).get("date-parts",[["NA"]])[0]),"NA")
-    authors,abstract=[x.get("family","")for x in it.get("author",[])if x.get("family")],it.get("abstract","")
+    doi=it.get("DOI","")
+    title=safe_json_str(" ".join(it.get("title",[])))if it.get("title")else""
+    year=next(iter(it.get("issued",{}).get("date-parts",[["NA"]])[0]),"NA")
+    authors=[x.get("family","")for x in it.get("author",[])if x.get("family")]
+    abstract=safe_json_str(it.get("abstract",""))
     fulltext=f"{title} {abstract}".strip()
-    if not filt(fulltext):return{"status":"filtered","doi":doi}
-    if not doi:return{"status":"no_doi"}
+    
+    if not filt(fulltext):return{"status":"filtered","doi":doi,"year":year}
+    if not doi:return{"status":"no_doi","year":year}
     rec={"doi":doi,"title":title,"year":year}
     
     for fn,src in[(lambda:ChoosePDFUnpaywall(QueryUnpaywall(s,doi,a.email)),"Unpaywall"),
@@ -122,7 +130,7 @@ def process_item(it,s,a,filt):
         try:
             result=fn();time.sleep(.08)
             pdf,ver=result if isinstance(result,tuple)else(result,None)
-            if pdf:rec.update({"pdf_url":pdf,"source":src,"version":ver});break
+            if pdf:rec.update({"pdf_url":pdf,"source":src,"version":ver if ver else"unknown"});break
         except:continue
     
     if not rec.get("pdf_url"):
@@ -135,11 +143,40 @@ def process_item(it,s,a,filt):
     fname=SafeFileName(f"{year}_{authors[0]if authors else'unk'}_{title[:60]}")+".pdf"
     path=os.path.join(a.output,fname)
     ok,err=DownloadPDF(s,rec["pdf_url"],path)
-    if not ok:return{**rec,"status":"fail","error":err}
+    if not ok:return{**rec,"status":"fail","error":safe_json_str(str(err))}
     try:
         if not TextCheck(path):os.remove(path);return{**rec,"status":"empty"}
     except:return{**rec,"status":"corrupt"}
     return{**rec,"status":"ok","local_path":path,"size":os.path.getsize(path)}
+
+def write_jsonl(meta,data):
+    try:
+        with open(meta,"a",encoding="utf-8")as f:
+            f.write(json.dumps(data,ensure_ascii=False)+"\n")
+    except Exception as e:
+        print(f"[!] JSON write error: {e}",flush=True)
+
+def read_jsonl(meta):
+    if not os.path.exists(meta):return[]
+    results=[]
+    with open(meta,"r",encoding="utf-8")as f:
+        for line in f:
+            line=line.strip()
+            if not line:continue
+            try:results.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"[!] Skipping corrupt line: {e}",flush=True)
+                continue
+    return results
+
+def process_year_batch(year,items,s,a,filt,meta):
+    print(f"\n[>>] Processing year {year}: {len(items)} entries...",flush=True)
+    with ThreadPoolExecutor(max_workers=THREADS)as ex:
+        futs=[ex.submit(process_item,it,s,a,filt)for it in items]
+        for f in tqdm(as_completed(futs),total=len(futs),desc=f"Year {year}",unit="doc",dynamic_ncols=True,colour="cyan"):
+            try:r=f.result()
+            except Exception as e:r={"status":"thread_err","error":safe_json_str(str(e)),"year":year}
+            write_jsonl(meta,r)
 
 graceful_exit=lambda sig,frame:(print("\n[!] Ceased by operator.",flush=True),os._exit(0))
 
@@ -153,36 +190,42 @@ def main():
 
     s=requests.Session();ad=HTTPAdapter(max_retries=RETRIES,pool_connections=10,pool_maxsize=10)
     s.mount("http://",ad);s.mount("https://",ad)
-    s.headers.update({"User-Agent":f"AlphaHarvest/v0.8.9 (mailto:{a.email})"})
+    s.headers.update({"User-Agent":f"AlphaHarvest/v1.0 (mailto:{a.email})"})
 
-    print(f"\n{'='*58}\n  Alpha Harvest v0.8.9 — Automated Article Farm\n{'='*58}")
+    print(f"\n{'='*58}\n  Alpha Harvest v0.9.0 — Automated Article Farm\n{'='*58}")
     print(f"\n[>] Query: '{a.keywords}'")
     bool_filter=ParseBooleanExpr(a.keywords)
     search_terms=re.sub(r'[()]','',re.sub(r'\s+(AND|OR)\s+',' ',a.keywords))
     print(f"[>] Time span: {a.start}–{a.end} ({a.end-a.start+1} years)")
     print(f"[>] Destination: {a.output}\n{'-'*60}\n");sys.stdout.flush()
 
-    all_items=sum(list(filter(None,map(lambda y:SearchCrossRef(s,search_terms,y),range(a.start,a.end+1)))),[])
-    
-    print(f"\n{'-'*60}\n[#] Aggregate yield: {len(all_items)} entries (pre-filter)\n{'-'*60}\n");sys.stdout.flush()
-    if not all_items:print("[X] Null harvest. Verify parameters.\n",flush=True);return
+    total_processed=0
+    for year in range(a.start,a.end+1):
+        year_items=SearchCrossRef(s,search_terms,year)
+        if not year_items:
+            print(f"[!] Year {year}: no entries found, skipping...\n",flush=True)
+            continue
+        
+        process_year_batch(year,year_items,s,a,bool_filter,meta)
+        total_processed+=len(year_items)
+        
+        all_res=read_jsonl(meta)
+        year_res=list(filter(lambda r:r.get("year")==year,all_res))
+        valids=list(filter(lambda r:r.get("status")=="ok",year_res))
+        
+        print(f"[#] Year {year} complete: {len(valids)}/{len(year_items)} PDFs retrieved\n{'-'*60}",flush=True)
+        time.sleep(1)
 
-    print(f"[>>] Engaging parallel fetch ({THREADS} threads) w/ boolean sieve...\n",flush=True);time.sleep(.5)
-    with ThreadPoolExecutor(max_workers=THREADS)as ex:
-        futs=[ex.submit(process_item,it,s,a,bool_filter)for it in all_items]
-        for f in tqdm(as_completed(futs),total=len(futs),desc="Harvesting",unit="doc",dynamic_ncols=True,colour="cyan"):
-            try:r=f.result()
-            except Exception as e:r={"status":"thread_err","error":str(e)}
-            open(meta,"a",encoding="utf-8").write(json.dumps(r,ensure_ascii=False)+"\n")
-
-    all_res=list(map(json.loads,open(meta,encoding="utf-8").read().splitlines()))
+    print(f"\n{'='*60}\n[#] FINAL STATISTICS\n{'='*60}")
+    all_res=read_jsonl(meta)
     valids=list(filter(lambda r:r.get("status")=="ok",all_res))
     filtered=list(filter(lambda r:r.get("status")=="filtered",all_res))
     failed=list(filter(lambda r:r.get("status")in("no_pdf","fail","empty","corrupt"),all_res))
     
-    print(f"\n{'-'*60}\n[#] Sieved: {len(filtered)} entries (non-conformant)")
+    print(f"[#] Total processed: {total_processed} entries")
+    print(f"[#] Sieved (boolean): {len(filtered)} entries")
     print(f"[#] Failed retrieval: {len(failed)} entries")
-    print(f"[OK] Yield: {len(valids)}/{len(all_items)-len(filtered)} valid PDFs ({100*len(valids)//max(len(all_items)-len(filtered),1)}%)")
+    print(f"[OK] Final yield: {len(valids)}/{total_processed-len(filtered)} valid PDFs ({100*len(valids)//max(total_processed-len(filtered),1)}%)")
     print(f"[#] Metadata: {meta}\n");sys.stdout.flush()
 
 if __name__=="__main__":main()

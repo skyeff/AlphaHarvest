@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+*.egg-info/
+.Python
+
+# Arquivos do projeto (NÃO versionar PDFs/dados)
+papers/
+*.pdf
+metadata.jsonl
+*.jsonl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.spyproject/
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporários
+test/
+temp/
+*.tmp
